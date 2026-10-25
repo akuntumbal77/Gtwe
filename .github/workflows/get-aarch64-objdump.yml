@@ -1,0 +1,26 @@
+name: Get aarch64 objdump (x86_64 host)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  fetch-tool:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install cross binutils for aarch64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
+
+      - name: Locate and verify the binary
+        run: |
+          which aarch64-linux-gnu-objdump
+          aarch64-linux-gnu-objdump --version
+          cp "$(which aarch64-linux-gnu-objdump)" ./aarch64-linux-gnu-objdump
+          file ./aarch64-linux-gnu-objdump
+
+      - name: Upload the objdump binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-objdump-x86_64-host
+          path: ./aarch64-linux-gnu-objdump
