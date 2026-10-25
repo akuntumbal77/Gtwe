@@ -7,6 +7,10 @@ on:
         description: "Direct/sourceforge URL to the ROM zip"
         required: true
         default: "https://sourceforge.net/projects/infinity-x/files/whyred/16/vanilla/Project_Infinity-X-3.11-whyred-11.06.2026-VANILLA-OFFICIAL.zip/download"
+      mirror_url:
+        description: "Optional: a direct *.dl.sourceforge.net mirror URL copied from your browser's download link, used if sourceforge.net blocks the runner"
+        required: false
+        default: ""
       init_path:
         description: "Path of init inside system.img (try /bin/init first, fallback /system/bin/init)"
         required: true
@@ -28,40 +32,62 @@ jobs:
 
       - name: Download ROM zip
         run: |
-          set -e
+          set +e
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
           URL="${{ github.event.inputs.rom_url }}"
+          MANUAL_MIRROR="${{ github.event.inputs.mirror_url }}"
 
           fetch() {
             echo "Fetching: $1"
-            curl -L -A "$UA" --retry 5 --retry-delay 5 --retry-connrefused \
+            curl -sS -L -A "$UA" --retry 5 --retry-delay 5 --retry-connrefused \
               -D headers.txt -o rom.zip "$1"
           }
 
-          fetch "$URL"
+          is_zip() { file -b rom.zip | grep -qi "Zip archive"; }
 
-          # SourceForge sometimes serves an HTML mirror-selection page instead
-          # of redirecting straight to the file. Detect that and recover.
-          TYPE=$(file -b rom.zip)
-          echo "Downloaded type: $TYPE"
-          if echo "$TYPE" | grep -qi "HTML"; then
-            echo "Got HTML instead of a zip, looking for a direct mirror link..."
-            MIRROR_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.dl\.sourceforge\.net/project/[^"'"'"']+' rom.zip | head -n1)
-            if [ -z "$MIRROR_URL" ]; then
-              MIRROR_URL=$(grep -oE 'url=https://[^"'"'"']+' rom.zip | sed 's/^url=//' | head -n1)
+          # If this is a pixeldrain share link, convert it to the direct
+          # file-download API endpoint first (pixeldrain isn't behind a
+          # Cloudflare bot challenge, so this usually just works).
+          PD_ID=$(echo "$URL" | sed -nE 's#^https?://pixeldrain\.com/u/([A-Za-z0-9]+).*#\1#p')
+          if [ -n "$PD_ID" ]; then
+            URL="https://pixeldrain.com/api/file/${PD_ID}"
+            echo "Detected pixeldrain link, using direct API URL: $URL"
+          fi
+
+          # Attempt 1: the given URL (sourceforge.net project pages are
+          # often blocked by a Cloudflare bot challenge when requested from
+          # datacenter IPs like GitHub Actions runners; pixeldrain direct
+          # links normally work on the first try).
+          fetch "$URL"
+          echo "Attempt 1 type: $(file -b rom.zip)"
+
+          # Attempt 2: derive the downloads.sourceforge.net redirector URL,
+          # which is a separate legacy service that sometimes isn't behind
+          # the same Cloudflare challenge as the main site.
+          if ! is_zip; then
+            PROJECT_PATH=$(echo "$URL" | sed -E 's#^https?://sourceforge\.net/projects/([^/]+)/files/(.+)/download/?$#\1/\2#')
+            if [ "$PROJECT_PATH" != "$URL" ]; then
+              ALT_URL="https://downloads.sourceforge.net/project/${PROJECT_PATH}"
+              fetch "$ALT_URL"
+              echo "Attempt 2 type: $(file -b rom.zip)"
             fi
-            if [ -n "$MIRROR_URL" ]; then
-              fetch "$MIRROR_URL"
-              TYPE=$(file -b rom.zip)
-              echo "Second attempt type: $TYPE"
-            fi
+          fi
+
+          # Attempt 3: a mirror URL the user copied by hand from a real
+          # browser (e.g. right-click the download button -> copy link, or
+          # read it from the browser's network tab) - this is a human
+          # request so it clears the Cloudflare challenge.
+          if ! is_zip && [ -n "$MANUAL_MIRROR" ]; then
+            fetch "$MANUAL_MIRROR"
+            echo "Attempt 3 type: $(file -b rom.zip)"
           fi
 
           ls -lh rom.zip
           file rom.zip
-          if ! file -b rom.zip | grep -qi "Zip archive"; then
-            echo "::error::Downloaded file is not a zip archive. Dumping response headers and first 2KB for debugging."
+          if ! is_zip; then
+            echo "::error::Could not get a real zip file. SourceForge is likely challenging this runner's IP. Dumping response headers and first 2KB of the body for debugging; re-run with a manual mirror_url if needed."
             cat headers.txt || true
+            echo "---- body preview ----"
             head -c 2000 rom.zip || true
             exit 1
           fi
