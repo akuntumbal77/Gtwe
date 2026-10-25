@@ -16,11 +16,36 @@ jobs:
         run: |
           which aarch64-linux-gnu-objdump
           aarch64-linux-gnu-objdump --version
-          cp "$(which aarch64-linux-gnu-objdump)" ./aarch64-linux-gnu-objdump
-          file ./aarch64-linux-gnu-objdump
 
-      - name: Upload the objdump binary
+      - name: Bundle the binary with its shared library dependencies
+        run: |
+          set -e
+          mkdir -p bundle/lib
+          BIN="$(which aarch64-linux-gnu-objdump)"
+          cp "$BIN" bundle/aarch64-linux-gnu-objdump.real
+
+          # Copy every shared lib this binary needs, except the dynamic
+          # linker itself and the virtual vDSO entry - those always come
+          # from the host it runs on.
+          ldd "$BIN" | awk '{print $3}' | grep '^/' | while read -r lib; do
+            cp -n "$lib" bundle/lib/ || true
+          done
+
+          # Wrapper script: point LD_LIBRARY_PATH at the bundled libs
+          # (relative to wherever the bundle ends up) before calling the
+          # real binary, so it runs standalone without needing apt install.
+          cat > bundle/aarch64-linux-gnu-objdump << 'EOF'
+          #!/bin/sh
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec env LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH" "$DIR/aarch64-linux-gnu-objdump.real" "$@"
+          EOF
+          chmod +x bundle/aarch64-linux-gnu-objdump
+
+          # Sanity check it actually runs in a clean shell before shipping it.
+          env -i bundle/aarch64-linux-gnu-objdump --version | head -3
+
+      - name: Upload the bundled objdump
         uses: actions/upload-artifact@v4
         with:
           name: aarch64-objdump-x86_64-host
-          path: ./aarch64-linux-gnu-objdump
+          path: bundle/
