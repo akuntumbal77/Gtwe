@@ -1,0 +1,93 @@
+name: Extract init from ROM
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Direct/sourceforge URL to the ROM zip"
+        required: true
+        default: "https://sourceforge.net/projects/infinity-x/files/whyred/16/vanilla/Project_Infinity-X-3.11-whyred-11.06.2026-VANILLA-OFFICIAL.zip/download"
+      init_path:
+        description: "Path of init inside system.img (try /bin/init first, fallback /system/bin/init)"
+        required: true
+        default: "/bin/init"
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y brotli python3 e2fsprogs unzip curl
+
+      - name: Download ROM zip
+        run: |
+          curl -L -A "Mozilla/5.0" \
+            -o rom.zip \
+            "${{ github.event.inputs.rom_url }}"
+          ls -lh rom.zip
+          file rom.zip
+
+      - name: List zip contents
+        run: unzip -l rom.zip | tee zip_listing.txt
+
+      - name: Extract system.new.dat.br and transfer list
+        run: |
+          mkdir -p work
+          unzip -o rom.zip "system.new.dat.br" "system.transfer.list" -d work || \
+          unzip -o rom.zip "*/system.new.dat.br" "*/system.transfer.list" -d work
+          find work -maxdepth 3 -iname "system.new.dat.br" -o -iname "system.transfer.list"
+
+      - name: Decompress .br to .dat
+        run: |
+          cd work
+          f=$(find . -iname "system.new.dat.br" | head -n1)
+          brotli -d "$f" -o system.new.dat
+          ls -lh system.new.dat
+
+      - name: Get sdat2img.py
+        run: |
+          curl -L -o sdat2img.py \
+            https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+
+      - name: Convert sparse data to system.img
+        run: |
+          tlist=$(find work -iname "system.transfer.list" | head -n1)
+          python3 sdat2img.py "$tlist" work/system.new.dat system.img
+          ls -lh system.img
+          file system.img
+
+      - name: Extract init binary with debugfs
+        run: |
+          mkdir -p out
+          set -e
+          PATH1="${{ github.event.inputs.init_path }}"
+          echo "Trying $PATH1"
+          debugfs -R "dump $PATH1 out/init" system.img || true
+          if [ ! -s out/init ]; then
+            echo "Trying fallback /system/bin/init"
+            debugfs -R "dump /system/bin/init out/init" system.img || true
+          fi
+          ls -l out/
+          file out/init || true
+
+      - name: Record SELinux label and mode (for later re-insertion)
+        run: |
+          debugfs -R "ls -l $(dirname ${{ github.event.inputs.init_path }})" system.img | tee out/dir_listing.txt
+          debugfs -R "ea_list ${{ github.event.inputs.init_path }}" system.img | tee out/selinux_label.txt || true
+
+      - name: Upload init binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: init-binary
+          path: |
+            out/init
+            out/dir_listing.txt
+            out/selinux_label.txt
+          if-no-files-found: error
