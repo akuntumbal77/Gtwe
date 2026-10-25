@@ -43,7 +43,10 @@ jobs:
               -D headers.txt -o rom.zip "$1"
           }
 
-          is_zip() { file -b rom.zip | grep -qi "Zip archive"; }
+          # `file` sometimes misreports a valid zip as "Java archive data
+          # (JAR)" because zip/jar/apk all share the same PK magic bytes.
+          # Check the actual central directory instead.
+          is_zip() { python3 -c "import zipfile,sys; sys.exit(0 if zipfile.is_zipfile('rom.zip') else 1)"; }
 
           # If this is a pixeldrain share link, convert it to the direct
           # file-download API endpoint first (pixeldrain isn't behind a
