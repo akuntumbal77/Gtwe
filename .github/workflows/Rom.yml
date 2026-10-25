@@ -28,11 +28,43 @@ jobs:
 
       - name: Download ROM zip
         run: |
-          curl -L -A "Mozilla/5.0" \
-            -o rom.zip \
-            "${{ github.event.inputs.rom_url }}"
+          set -e
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+          URL="${{ github.event.inputs.rom_url }}"
+
+          fetch() {
+            echo "Fetching: $1"
+            curl -L -A "$UA" --retry 5 --retry-delay 5 --retry-connrefused \
+              -D headers.txt -o rom.zip "$1"
+          }
+
+          fetch "$URL"
+
+          # SourceForge sometimes serves an HTML mirror-selection page instead
+          # of redirecting straight to the file. Detect that and recover.
+          TYPE=$(file -b rom.zip)
+          echo "Downloaded type: $TYPE"
+          if echo "$TYPE" | grep -qi "HTML"; then
+            echo "Got HTML instead of a zip, looking for a direct mirror link..."
+            MIRROR_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.dl\.sourceforge\.net/project/[^"'"'"']+' rom.zip | head -n1)
+            if [ -z "$MIRROR_URL" ]; then
+              MIRROR_URL=$(grep -oE 'url=https://[^"'"'"']+' rom.zip | sed 's/^url=//' | head -n1)
+            fi
+            if [ -n "$MIRROR_URL" ]; then
+              fetch "$MIRROR_URL"
+              TYPE=$(file -b rom.zip)
+              echo "Second attempt type: $TYPE"
+            fi
+          fi
+
           ls -lh rom.zip
           file rom.zip
+          if ! file -b rom.zip | grep -qi "Zip archive"; then
+            echo "::error::Downloaded file is not a zip archive. Dumping response headers and first 2KB for debugging."
+            cat headers.txt || true
+            head -c 2000 rom.zip || true
+            exit 1
+          fi
 
       - name: List zip contents
         run: unzip -l rom.zip | tee zip_listing.txt
@@ -91,3 +123,4 @@ jobs:
             out/dir_listing.txt
             out/selinux_label.txt
           if-no-files-found: error
+
