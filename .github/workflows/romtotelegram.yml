@@ -1,5 +1,5 @@
 
-name: Download ROM and Send Vendor Files to Telegram
+name: PixelDrain ROM to Telegram User
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rom-to-telegram
+  group: rom-to-telegram-user
   cancel-in-progress: false
 
 jobs:
@@ -17,135 +17,147 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Install tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full curl coreutils findutils
+          sudo apt-get install -y p7zip-full python3-pip
+          python3 -m pip install telethon
 
-      - name: Download ROM from PixelDrain
+      - name: Download ROM
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/rom-work/extracted"
-          cd "$RUNNER_TEMP/rom-work"
+
+          WORK="$RUNNER_TEMP/rom-work"
+          mkdir -p "$WORK/extracted"
 
           curl -fL --retry 3 --retry-delay 5 \
             --connect-timeout 30 \
             --max-time 7200 \
             "https://pixeldrain.com/api/file/9tcNaYNe?download" \
-            -o rom-download
+            -o "$WORK/rom-download"
 
-          test -s rom-download
-          echo "Download complete."
-          ls -lh rom-download
-          file rom-download
+          test -s "$WORK/rom-download"
+          echo "ROM downloaded successfully."
+          ls -lh "$WORK/rom-download"
 
       - name: Extract ROM
         shell: bash
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/rom-work"
 
-          7z x rom-download \
-            -o"$RUNNER_TEMP/rom-work/extracted" \
-            -y
+          WORK="$RUNNER_TEMP/rom-work"
 
-          echo "Extraction complete."
+          7z x "$WORK/rom-download" \
+            -o"$WORK/extracted" -y
 
-      - name: Find and send vendor files to Telegram
-        shell: bash
+          echo "ROM extraction completed."
+
+      - name: Send vendor files using Telegram account
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELE_API_ID: ${{ secrets.TELE_API_ID }}
+          TELE_API_HASH: ${{ secrets.TELE_API_HASH }}
+          TELE_SESSION: ${{ secrets.TELE_SESSION }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          ROOT="$RUNNER_TEMP/rom-work/extracted"
-          SEND_DIR="$RUNNER_TEMP/rom-work/to-send"
-          mkdir -p "$SEND_DIR"
+          python3 - <<'PY'
+          import asyncio
+          import os
+          import sys
+          from pathlib import Path
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
 
-          : "${TG_BOT_TOKEN:?Missing TG_BOT_TOKEN secret}"
-          : "${TG_CHAT_ID:?Missing TG_CHAT_ID secret}"
+          WORK = Path(os.environ["RUNNER_TEMP"]) / "rom-work"
+          ROOT = WORK / "extracted"
 
-          # Locate the requested files.
-          for name in \
-            vendor.new.dat.br \
-            vendor.patch.dat \
-            vendor.transfer.list
-          do
-            found="$(find "$ROOT" -type f -name "$name" -print -quit)"
+          api_id = int(os.environ["TELE_API_ID"])
+          api_hash = os.environ["TELE_API_HASH"]
+          session = os.environ["TELE_SESSION"]
+          chat_id = int(os.environ["TG_CHAT_ID"])
 
-            if [[ -z "$found" ]]; then
-              echo "ERROR: $name was not found in the extracted ROM."
-              exit 1
-            fi
+          TARGETS = [
+              "vendor.new.dat.br",
+              "vendor.patch.dat",
+              "vendor.transfer.list",
+          ]
 
-            cp -- "$found" "$SEND_DIR/$name"
-            echo "Found: $name ($(du -h "$found" | cut -f1))"
-          done
+          async def main():
+              client = TelegramClient(
+                  StringSession(session),
+                  api_id,
+                  api_hash,
+                  connection_retries=3,
+                  request_retries=3,
+              )
 
-          # Standard Telegram Bot API upload limit:
-          # keep every uploaded document below 50 MB.
-          MAX_BYTES=$((45 * 1024 * 1024))
+              await client.connect()
 
-          send_document() {
-            local path="$1"
-            local caption="$2"
+              try:
+                  if not await client.is_user_authorized():
+                      raise RuntimeError(
+                          "Session is unauthorized. Create a new "
+                          "Telethon session locally and update TELE_SESSION."
+                      )
 
-            curl --fail-with-body --silent --show-error \
-              --max-time 600 \
-              --retry 2 \
-              --form "chat_id=${TG_CHAT_ID}" \
-              --form "caption=${caption}" \
-              --form "document=@${path};filename=$(basename "$path")" \
-              "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-              -o "$RUNNER_TEMP/telegram-response.json"
+                  destination = await client.get_input_entity(chat_id)
 
-            python3 -c '
-          import json, sys
-          d = json.load(open(sys.argv[1]))
-          if not d.get("ok"):
-              print("Telegram API error:", d)
-              sys.exit(1)
-          print("Telegram upload successful.")
-          ' "$RUNNER_TEMP/telegram-response.json"
-          }
+                  for name in TARGETS:
+                      matches = sorted(
+                          p for p in ROOT.rglob(name) if p.is_file()
+                      )
 
-          # Split oversized files into Telegram-compatible chunks.
-          for original in "$SEND_DIR"/vendor.*; do
-            [[ -f "$original" ]] || continue
+                      if not matches:
+                          await client.send_message(
+                              destination,
+                              f"ROM extraction: {name} was not found."
+                          )
+                          print(f"Not found: {name}")
+                          continue
 
-            size=$(stat -c '%s' "$original")
-            name=$(basename "$original")
+                      path = matches[0]
+                      size = path.stat().st_size
 
-            if (( size <= MAX_BYTES )); then
-              send_document "$original" "$name"
-            else
-              echo "Splitting oversized file: $name"
-              mkdir -p "$SEND_DIR/chunks"
+                      if size == 0:
+                          await client.send_message(
+                              destination,
+                              f"{name} exists in the ROM but is empty (0 bytes)."
+                          )
+                          print(f"Empty file: {name}")
+                          continue
 
-              split -b "$MAX_BYTES" -d -a 4 \
-                --additional-suffix=.part \
-                "$original" "$SEND_DIR/chunks/${name}."
+                      print(
+                          f"Sending {name} ({size / 1024 / 1024:.2f} MiB)"
+                      )
 
-              total=$(find "$SEND_DIR/chunks" -type f | wc -l)
+                      await client.send_file(
+                          destination,
+                          str(path),
+                          caption=name,
+                          force_document=True,
+                          part_size_kb=512,
+                          progress_callback=lambda sent, total: None,
+                      )
 
-              send_document "$original" \
-                "$name is larger than Telegram's upload limit. Split parts follow; concatenate them in order to reconstruct the original."
+                      print(f"Sent: {name}")
 
-              for part in "$SEND_DIR/chunks"/"${name}".*.part; do
-                send_document "$part" \
-                  "$name — chunk $(basename "$part")"
-              done
-            fi
-          done
+                  await client.send_message(
+                      destination,
+                      "ROM vendor file processing completed."
+                  )
 
-          echo "All requested vendor files have been sent."
+              finally:
+                  await client.disconnect()
 
-      - name: Cleanup temporary ROM data
+          asyncio.run(main())
+          PY
+
+      - name: Remove temporary files
         if: always()
         shell: bash
         run: |
           rm -rf "$RUNNER_TEMP/rom-work"
-          rm -f "$RUNNER_TEMP/telegram-response.json"
-          echo "Temporary files cleaned up."
+          echo "Temporary ROM files removed."
