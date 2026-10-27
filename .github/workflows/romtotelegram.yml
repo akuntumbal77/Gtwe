@@ -1,0 +1,151 @@
+
+name: Download ROM and Send Vendor Files to Telegram
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rom-to-telegram
+  cancel-in-progress: false
+
+jobs:
+  download-extract-send:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full curl coreutils findutils
+
+      - name: Download ROM from PixelDrain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rom-work/extracted"
+          cd "$RUNNER_TEMP/rom-work"
+
+          curl -fL --retry 3 --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 7200 \
+            "https://pixeldrain.com/api/file/9tcNaYNe?download" \
+            -o rom-download
+
+          test -s rom-download
+          echo "Download complete."
+          ls -lh rom-download
+          file rom-download
+
+      - name: Extract ROM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/rom-work"
+
+          7z x rom-download \
+            -o"$RUNNER_TEMP/rom-work/extracted" \
+            -y
+
+          echo "Extraction complete."
+
+      - name: Find and send vendor files to Telegram
+        shell: bash
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          ROOT="$RUNNER_TEMP/rom-work/extracted"
+          SEND_DIR="$RUNNER_TEMP/rom-work/to-send"
+          mkdir -p "$SEND_DIR"
+
+          : "${TG_BOT_TOKEN:?Missing TG_BOT_TOKEN secret}"
+          : "${TG_CHAT_ID:?Missing TG_CHAT_ID secret}"
+
+          # Locate the requested files.
+          for name in \
+            vendor.new.dat.br \
+            vendor.patch.dat \
+            vendor.transfer.list
+          do
+            found="$(find "$ROOT" -type f -name "$name" -print -quit)"
+
+            if [[ -z "$found" ]]; then
+              echo "ERROR: $name was not found in the extracted ROM."
+              exit 1
+            fi
+
+            cp -- "$found" "$SEND_DIR/$name"
+            echo "Found: $name ($(du -h "$found" | cut -f1))"
+          done
+
+          # Standard Telegram Bot API upload limit:
+          # keep every uploaded document below 50 MB.
+          MAX_BYTES=$((45 * 1024 * 1024))
+
+          send_document() {
+            local path="$1"
+            local caption="$2"
+
+            curl --fail-with-body --silent --show-error \
+              --max-time 600 \
+              --retry 2 \
+              --form "chat_id=${TG_CHAT_ID}" \
+              --form "caption=${caption}" \
+              --form "document=@${path};filename=$(basename "$path")" \
+              "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+              -o "$RUNNER_TEMP/telegram-response.json"
+
+            python3 -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          if not d.get("ok"):
+              print("Telegram API error:", d)
+              sys.exit(1)
+          print("Telegram upload successful.")
+          ' "$RUNNER_TEMP/telegram-response.json"
+          }
+
+          # Split oversized files into Telegram-compatible chunks.
+          for original in "$SEND_DIR"/vendor.*; do
+            [[ -f "$original" ]] || continue
+
+            size=$(stat -c '%s' "$original")
+            name=$(basename "$original")
+
+            if (( size <= MAX_BYTES )); then
+              send_document "$original" "$name"
+            else
+              echo "Splitting oversized file: $name"
+              mkdir -p "$SEND_DIR/chunks"
+
+              split -b "$MAX_BYTES" -d -a 4 \
+                --additional-suffix=.part \
+                "$original" "$SEND_DIR/chunks/${name}."
+
+              total=$(find "$SEND_DIR/chunks" -type f | wc -l)
+
+              send_document "$original" \
+                "$name is larger than Telegram's upload limit. Split parts follow; concatenate them in order to reconstruct the original."
+
+              for part in "$SEND_DIR/chunks"/"${name}".*.part; do
+                send_document "$part" \
+                  "$name — chunk $(basename "$part")"
+              done
+            fi
+          done
+
+          echo "All requested vendor files have been sent."
+
+      - name: Cleanup temporary ROM data
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/rom-work"
+          rm -f "$RUNNER_TEMP/telegram-response.json"
+          echo "Temporary files cleaned up."
