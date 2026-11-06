@@ -1,18 +1,22 @@
-
-name: PixelDrain ROM to Telegram User
+name: PixelDrain ROM to Telegram (Interactive)
 
 on:
   workflow_dispatch:
+    inputs:
+      file_id:
+        description: PixelDrain file ID
+        required: true
+        default: DHRQX76G
 
 permissions:
   contents: read
 
 concurrency:
-  group: rom-to-telegram-user
+  group: rom-to-telegram-interactive
   cancel-in-progress: false
 
 jobs:
-  download-extract-send:
+  rom-bot:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -21,43 +25,39 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full python3-pip
-          python3 -m pip install telethon
+          python3 -m pip install telethon cryptg
 
       - name: Download ROM
         shell: bash
+        env:
+          FILE_ID: ${{ inputs.file_id }}
         run: |
           set -euo pipefail
 
           WORK="$RUNNER_TEMP/rom-work"
-          mkdir -p "$WORK/extracted"
+          mkdir -p "$WORK/dl"
+
+          [[ "$FILE_ID" =~ ^[A-Za-z0-9]+$ ]] || { echo "Invalid file id"; exit 1; }
+
+          NAME=$(curl -fsL "https://pixeldrain.com/api/file/$FILE_ID/info" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['name'])" \
+            2>/dev/null || true)
+          NAME=$(basename "${NAME:-rom.zip}")
+          [ -n "$NAME" ] || NAME="rom.zip"
 
           curl -fL --retry 3 --retry-delay 5 \
-            --connect-timeout 30 \
-            --max-time 7200 \
-            "https://pixeldrain.com/api/file/DHRQX76G?download" \
-            -o "$WORK/rom-download"
+            --connect-timeout 30 --max-time 7200 \
+            "https://pixeldrain.com/api/file/$FILE_ID?download" \
+            -o "$WORK/dl/$NAME"
 
-          test -s "$WORK/rom-download"
-          echo "ROM downloaded successfully."
-          ls -lh "$WORK/rom-download"
+          test -s "$WORK/dl/$NAME"
+          ls -lh "$WORK/dl"
 
-      - name: Extract ROM
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          WORK="$RUNNER_TEMP/rom-work"
-
-          7z x "$WORK/rom-download" \
-            -o"$WORK/extracted" -y
-
-          echo "ROM extraction completed."
-
-      - name: Send vendor files using Telegram account
+      - name: Interactive Telegram bot
         env:
           TELE_API_ID: ${{ secrets.TELE_API_ID }}
           TELE_API_HASH: ${{ secrets.TELE_API_HASH }}
-          TELE_SESSION: ${{ secrets.TELE_SESSION }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         shell: bash
         run: |
@@ -65,92 +65,284 @@ jobs:
 
           python3 - <<'PY'
           import asyncio
+          import json
           import os
-          import sys
+          import shutil
+          import urllib.parse
+          import urllib.request
           from pathlib import Path
-          from telethon import TelegramClient
+
+          from telethon import TelegramClient, events, Button
           from telethon.sessions import StringSession
+          from telethon.errors import MessageNotModifiedError
 
           WORK = Path(os.environ["RUNNER_TEMP"]) / "rom-work"
-          ROOT = WORK / "extracted"
+          DL = WORK / "dl"
+          EXT = WORK / "extracted"
+          OUT = WORK / "out"
 
-          api_id = int(os.environ["TELE_API_ID"])
-          api_hash = os.environ["TELE_API_HASH"]
-          session = os.environ["TELE_SESSION"]
-          chat_id = int(os.environ["TG_CHAT_ID"])
+          API_ID = int(os.environ["TELE_API_ID"])
+          API_HASH = os.environ["TELE_API_HASH"]
+          TOKEN = os.environ["BOT_TOKEN"]
+          CHAT = int(os.environ["TG_CHAT_ID"])
 
-          TARGETS = [
-              "vendor.new.dat.br",
-              "vendor.patch.dat",
-              "vendor.transfer.list",
+          PAGE = 8                     # item per halaman
+          IDLE = 300                   # detik nunggu klik (5 menit)
+          LIMIT = 1900 * 1024 * 1024   # batas per file Telegram (~2GB)
+
+          queue = asyncio.Queue()
+
+          MENU = [
+              [("📤 Kirim full ROM", "m:full")],
+              [("📂 Unpack & pilih file", "m:unpack")],
+              [("✅ Selesai (cukup download)", "m:done")],
           ]
 
+
+          # ---------- helpers ----------
+          def human(n):
+              for u in ("B", "KB", "MB", "GB"):
+                  if n < 1024:
+                      return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+                  n /= 1024
+              return f"{n:.1f} TB"
+
+
+          def dir_size(p):
+              return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+
+          def tl(rows):
+              return [[Button.inline(l, d.encode()) for l, d in r] for r in rows]
+
+
+          def tg_send(text, rows=None):
+              """Kirim pesan lewat Bot API (aman walau entity belum dikenal)."""
+              data = {"chat_id": str(CHAT), "text": text}
+              if rows:
+                  data["reply_markup"] = json.dumps({
+                      "inline_keyboard": [
+                          [{"text": l, "callback_data": d} for l, d in r]
+                          for r in rows
+                      ]
+                  })
+              req = urllib.request.Request(
+                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  urllib.parse.urlencode(data).encode(),
+              )
+              urllib.request.urlopen(req, timeout=30).read()
+
+
+          async def run(cmd, cwd=None):
+              p = await asyncio.create_subprocess_exec(
+                  *cmd, cwd=cwd,
+                  stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.STDOUT,
+              )
+              out, _ = await p.communicate()
+              return p.returncode, out.decode(errors="ignore")
+
+
+          async def edit(ev, text, rows=None):
+              try:
+                  await ev.edit(text, buttons=tl(rows) if rows else None)
+              except MessageNotModifiedError:
+                  pass
+
+
+          async def wait_click():
+              try:
+                  return await asyncio.wait_for(queue.get(), IDLE)
+              except asyncio.TimeoutError:
+                  return None
+
+
+          async def send_path(client, chat, path, label=None):
+              """Kirim file/folder. Folder di-zip, file >1.9GB dipecah."""
+              shutil.rmtree(OUT, ignore_errors=True)
+              OUT.mkdir(parents=True)
+              name = label or path.name
+              note = ""
+
+              if path.is_dir():
+                  base = OUT / f"{name}.zip"
+                  rc, log = await run(
+                      ["7z", "a", "-tzip", "-mx0", "-v1900m",
+                       str(base), path.name],
+                      cwd=str(path.parent),
+                  )
+                  if rc != 0:
+                      raise RuntimeError(f"zip gagal:\n{log[-500:]}")
+                  parts = sorted(OUT.iterdir())
+                  if len(parts) == 1:
+                      parts = [parts[0].rename(OUT / f"{name}.zip")]
+                  else:
+                      note = "Multi-part zip: taruh semua part satu folder, buka .001 dengan 7-Zip."
+              else:
+                  if path.stat().st_size <= LIMIT:
+                      parts = [path]
+                  else:
+                      rc, log = await run([
+                          "split", "-b", "1900M", "-d", "-a", "2",
+                          str(path), str(OUT / f"{name}.part"),
+                      ])
+                      if rc != 0:
+                          raise RuntimeError(f"split gagal:\n{log[-500:]}")
+                      parts = sorted(OUT.iterdir())
+                      note = f"Gabung: cat {name}.part* > {name}"
+
+              n = len(parts)
+              for i, part in enumerate(parts, 1):
+                  cap = name if n == 1 else f"{name} — part {i}/{n}"
+                  await client.send_file(
+                      chat, str(part),
+                      caption=cap,
+                      force_document=True,
+                      part_size_kb=512,
+                  )
+              if note:
+                  await client.send_message(chat, note)
+              shutil.rmtree(OUT, ignore_errors=True)
+
+
+          # ---------- main ----------
           async def main():
-              client = TelegramClient(
-                  StringSession(session),
-                  api_id,
-                  api_hash,
-                  connection_retries=3,
-                  request_retries=3,
+              rom = next(DL.iterdir())
+              client = TelegramClient(StringSession(), API_ID, API_HASH,
+                                      connection_retries=3, request_retries=3)
+              await client.start(bot_token=TOKEN)
+
+              async def on_click(ev):
+                  if ev.chat_id != CHAT:
+                      await ev.answer("Bukan buat kamu", alert=True)
+                      return
+                  await queue.put(ev)
+
+              client.add_event_handler(on_click, events.CallbackQuery())
+
+              tg_send(
+                  f"✅ ROM selesai didownload\n{rom.name} ({human(rom.stat().st_size)})\n\nMau diapakan?",
+                  MENU,
               )
 
-              await client.connect()
+              extracted = False
+              cwd = EXT
+              page = 0
+              listing = []
 
-              try:
-                  if not await client.is_user_authorized():
-                      raise RuntimeError(
-                          "Session is unauthorized. Create a new "
-                          "Telethon session locally and update TELE_SESSION."
-                      )
-
-                  destination = await client.get_input_entity(chat_id)
-
-                  for name in TARGETS:
-                      matches = sorted(
-                          p for p in ROOT.rglob(name) if p.is_file()
-                      )
-
-                      if not matches:
-                          await client.send_message(
-                              destination,
-                              f"ROM extraction: {name} was not found."
-                          )
-                          print(f"Not found: {name}")
-                          continue
-
-                      path = matches[0]
-                      size = path.stat().st_size
-
-                      if size == 0:
-                          await client.send_message(
-                              destination,
-                              f"{name} exists in the ROM but is empty (0 bytes)."
-                          )
-                          print(f"Empty file: {name}")
-                          continue
-
-                      print(
-                          f"Sending {name} ({size / 1024 / 1024:.2f} MiB)"
-                      )
-
-                      await client.send_file(
-                          destination,
-                          str(path),
-                          caption=name,
-                          force_document=True,
-                          part_size_kb=512,
-                          progress_callback=lambda sent, total: None,
-                      )
-
-                      print(f"Sent: {name}")
-
-                  await client.send_message(
-                      destination,
-                      "ROM vendor file processing completed."
+              async def show(ev):
+                  nonlocal listing, page
+                  listing = sorted(
+                      cwd.iterdir(),
+                      key=lambda p: (p.is_file(), p.name.lower()),
                   )
+                  total = max(1, (len(listing) + PAGE - 1) // PAGE)
+                  page = max(0, min(page, total - 1))
 
-              finally:
-                  await client.disconnect()
+                  rows = []
+                  for i in range(page * PAGE, min(len(listing), (page + 1) * PAGE)):
+                      p = listing[i]
+                      if p.is_dir():
+                          rows.append([(f"📁 {p.name}"[:40], f"o:{i}"),
+                                       ("⬇️ zip", f"z:{i}")])
+                      else:
+                          rows.append([(f"📄 {p.name} · {human(p.stat().st_size)}"[:60],
+                                        f"f:{i}")])
+
+                  nav = []
+                  if page > 0:
+                      nav.append(("◀️", "p:prev"))
+                  nav.append((f"{page + 1}/{total}", "p:noop"))
+                  if page < total - 1:
+                      nav.append(("▶️", "p:next"))
+                  rows.append(nav)
+
+                  ctrl = []
+                  if cwd != EXT:
+                      ctrl.append(("⬆️ Naik", "u"))
+                  ctrl.append(("📦 Zip folder ini", "zc"))
+                  rows.append(ctrl)
+                  rows.append([("🏠 Menu", "m:menu"), ("✅ Selesai", "m:done")])
+
+                  rel = "/" if cwd == EXT else "/" + str(cwd.relative_to(EXT))
+                  await edit(ev, f"📂 {rel}\n{len(listing)} item\nTap 📄 = kirim file, 📁 = buka, ⬇️ = kirim zip", rows)
+
+              async def deliver(ev, chat, path, label=None):
+                  st = await client.send_message(chat, f"⏳ Menyiapkan & mengirim {label or path.name}...")
+                  try:
+                      await send_path(client, chat, path, label)
+                  except Exception as e:
+                      await client.send_message(chat, f"❌ Gagal: {e}")
+                  finally:
+                      await st.delete()
+
+              while True:
+                  ev = await wait_click()
+                  if ev is None:
+                      tg_send("⏰ Tidak ada respon 5 menit, workflow dihentikan.")
+                      break
+
+                  await ev.answer()
+                  chat = await ev.get_input_chat()
+                  d = ev.data.decode()
+
+                  try:
+                      if d == "m:done":
+                          await edit(ev, "✅ Selesai. Workflow dihentikan.",
+                                     [[("✅ Selesai", "x")]])
+                          break
+
+                      elif d == "m:menu":
+                          await edit(ev, "Mau diapakan?", MENU)
+
+                      elif d == "m:full":
+                          await deliver(ev, chat, rom)
+                          await edit(ev, "✅ Full ROM terkirim.\n\nMau diapakan lagi?", MENU)
+
+                      elif d == "m:unpack":
+                          if not extracted:
+                              await edit(ev, "⏳ Unpacking ROM...")
+                              rc, log = await run(["7z", "x", str(rom), f"-o{EXT}", "-y"])
+                              if rc != 0:
+                                  await edit(ev, f"❌ Unpack gagal:\n{log[-500:]}", MENU)
+                                  continue
+                              extracted = True
+                          cwd, page = EXT, 0
+                          await show(ev)
+
+                      elif not extracted:
+                          await ev.answer("Unpack dulu", alert=True)
+
+                      elif d == "p:next":
+                          page += 1
+                          await show(ev)
+                      elif d == "p:prev":
+                          page -= 1
+                          await show(ev)
+                      elif d == "p:noop":
+                          pass
+                      elif d == "u":
+                          cwd, page = cwd.parent, 0
+                          await show(ev)
+                      elif d == "zc":
+                          label = rom.stem if cwd == EXT else cwd.name
+                          await deliver(ev, chat, cwd, label)
+
+                      elif d[:2] in ("o:", "z:", "f:"):
+                          i = int(d[2:])
+                          if not (0 <= i < len(listing)):
+                              continue
+                          p = listing[i]
+                          if d[0] == "o":
+                              cwd, page = p, 0
+                              await show(ev)
+                          else:  # z (zip folder) atau f (file)
+                              await deliver(ev, chat, p)
+                  except Exception as e:
+                      tg_send(f"❌ Error: {e}")
+
+              await client.disconnect()
+
 
           asyncio.run(main())
           PY
