@@ -31,6 +31,7 @@ jobs:
         shell: bash
         env:
           FILE_ID: ${{ inputs.file_id }}
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -39,18 +40,38 @@ jobs:
 
           [[ "$FILE_ID" =~ ^[A-Za-z0-9]+$ ]] || { echo "Invalid file id"; exit 1; }
 
-          NAME=$(curl -fsL "https://pixeldrain.com/api/file/$FILE_ID/info" \
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          AUTH=()
+          if [ -n "${PD_KEY:-}" ]; then
+            AUTH=(-u ":$PD_KEY")
+            echo "Pakai Pixeldrain API key."
+          fi
+
+          NAME=$(curl -sL -A "$UA" "${AUTH[@]}" \
+            "https://pixeldrain.com/api/file/$FILE_ID/info" \
             | python3 -c "import sys,json;print(json.load(sys.stdin)['name'])" \
             2>/dev/null || true)
           NAME=$(basename "${NAME:-rom.zip}")
           [ -n "$NAME" ] || NAME="rom.zip"
+          echo "Nama file: $NAME"
 
-          curl -fL --retry 3 --retry-delay 5 \
-            --connect-timeout 30 --max-time 7200 \
-            "https://pixeldrain.com/api/file/$FILE_ID?download" \
-            -o "$WORK/dl/$NAME"
+          OUTF="$WORK/dl/$NAME"
+          OK=0
+          for i in 1 2 3; do
+            HTTP=$(curl -sL -A "$UA" "${AUTH[@]}" \
+              -e "https://pixeldrain.com/u/$FILE_ID" \
+              --connect-timeout 30 --max-time 7200 \
+              -w '%{http_code}' -o "$OUTF" \
+              "https://pixeldrain.com/api/file/$FILE_ID?download" || true)
+            if [ "$HTTP" = "200" ] && [ -s "$OUTF" ]; then OK=1; break; fi
+            echo "Percobaan $i gagal, HTTP $HTTP. Respon server:"
+            head -c 600 "$OUTF" 2>/dev/null || true
+            echo
+            rm -f "$OUTF"
+            sleep 10
+          done
 
-          test -s "$WORK/dl/$NAME"
+          [ "$OK" = "1" ] || { echo "Download gagal (lihat respon server di atas)."; exit 1; }
           ls -lh "$WORK/dl"
 
       - name: Interactive Telegram bot
