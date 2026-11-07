@@ -3,10 +3,10 @@ name: PixelDrain ROM to Telegram (Interactive)
 on:
   workflow_dispatch:
     inputs:
-      file_id:
-        description: PixelDrain file ID
+      url:
+        description: Link ROM (Telegram t.me, Pixeldrain, atau direct link)
         required: true
-        default: DHRQX76G
+        default: https://pixeldrain.com/u/DHRQX76G
 
 permissions:
   contents: read
@@ -30,48 +30,134 @@ jobs:
       - name: Download ROM
         shell: bash
         env:
-          FILE_ID: ${{ inputs.file_id }}
+          ROM_URL: ${{ inputs.url }}
           PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          TELE_API_ID: ${{ secrets.TELE_API_ID }}
+          TELE_API_HASH: ${{ secrets.TELE_API_HASH }}
+          TELE_SESSION: ${{ secrets.TELE_SESSION }}
         run: |
           set -euo pipefail
 
           WORK="$RUNNER_TEMP/rom-work"
           mkdir -p "$WORK/dl"
 
-          [[ "$FILE_ID" =~ ^[A-Za-z0-9]+$ ]] || { echo "Invalid file id"; exit 1; }
+          [[ "$ROM_URL" =~ ^https?:// ]] || { echo "URL harus diawali http:// atau https://"; exit 1; }
 
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          AUTH=()
-          if [ -n "${PD_KEY:-}" ]; then
-            AUTH=(-u ":$PD_KEY")
-            echo "Pakai Pixeldrain API key."
-          fi
 
-          NAME=$(curl -sL -A "$UA" "${AUTH[@]}" \
-            "https://pixeldrain.com/api/file/$FILE_ID/info" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['name'])" \
-            2>/dev/null || true)
-          NAME=$(basename "${NAME:-rom.zip}")
-          [ -n "$NAME" ] || NAME="rom.zip"
-          echo "Nama file: $NAME"
+          if [[ "$ROM_URL" =~ ^https?://t\.me/ ]]; then
+            echo "Link Telegram terdeteksi."
+            python3 - <<'PY'
+          import asyncio
+          import os
+          import re
+          import sys
+          import time
+          from pathlib import Path
 
-          OUTF="$WORK/dl/$NAME"
-          OK=0
-          for i in 1 2 3; do
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+          url = os.environ["ROM_URL"].strip()
+          DL = Path(os.environ["RUNNER_TEMP"]) / "rom-work" / "dl"
+          DL.mkdir(parents=True, exist_ok=True)
+
+          m = re.match(
+              r"^https?://t\.me/(?:c/(\d+)|([A-Za-z0-9_]+))/(?:\d+/)?(\d+)/?(?:\?.*)?$",
+              url,
+          )
+          if not m:
+              sys.exit("Format link Telegram tidak dikenali (contoh: https://t.me/channel/123)")
+
+          private_id, username, msg_id = m.group(1), m.group(2), int(m.group(3))
+          target = int("-100" + private_id) if private_id else username
+
+          for k in ("TELE_API_ID", "TELE_API_HASH", "TELE_SESSION"):
+              if not os.environ.get(k):
+                  sys.exit(f"Secret {k} kosong")
+
+          last = [0.0]
+
+
+          def progress(done, total):
+              now = time.time()
+              if now - last[0] >= 10 or done == total:
+                  last[0] = now
+                  print(f"  {done / 1024 / 1024:.0f} / {total / 1024 / 1024:.0f} MiB "
+                        f"({done * 100 // max(total, 1)}%)", flush=True)
+
+
+          async def main():
+              client = TelegramClient(
+                  StringSession(os.environ["TELE_SESSION"]),
+                  int(os.environ["TELE_API_ID"]),
+                  os.environ["TELE_API_HASH"],
+                  connection_retries=5,
+                  request_retries=5,
+              )
+              await client.connect()
+              try:
+                  if not await client.is_user_authorized():
+                      sys.exit("TELE_SESSION tidak valid / expired, buat session baru.")
+
+                  msg = await client.get_messages(target, ids=msg_id)
+                  if not msg or not msg.media:
+                      sys.exit("Pesan tidak ditemukan atau tidak ada file/media-nya.")
+
+                  size = getattr(getattr(msg, "file", None), "size", 0) or 0
+                  print(f"Mengunduh {msg.file.name or 'file'} ({size / 1024 / 1024:.0f} MiB)...")
+                  path = await client.download_media(
+                      msg, file=str(DL) + os.sep, progress_callback=progress
+                  )
+                  if not path or not Path(path).is_file() or Path(path).stat().st_size == 0:
+                      sys.exit("Download dari Telegram gagal.")
+                  print(f"OK: {path}")
+              finally:
+                  await client.disconnect()
+
+
+          asyncio.run(main())
+          PY
+          elif [[ "$ROM_URL" =~ pixeldrain\.(com|net)/(u|api/file)/([A-Za-z0-9]+) ]]; then
+            FILE_ID="${BASH_REMATCH[3]}"
+            echo "Pixeldrain terdeteksi: $FILE_ID"
+
+            AUTH=()
+            if [ -n "${PD_KEY:-}" ]; then
+              AUTH=(-u ":$PD_KEY")
+              echo "Pakai Pixeldrain API key."
+            fi
+
+            NAME=$(curl -sL -A "$UA" "${AUTH[@]}" \
+              "https://pixeldrain.com/api/file/$FILE_ID/info" \
+              | python3 -c "import sys,json;print(json.load(sys.stdin)['name'])" \
+              2>/dev/null || true)
+            NAME=$(basename "${NAME:-rom.zip}")
+            [ -n "$NAME" ] || NAME="rom.zip"
+            OUTF="$WORK/dl/$NAME"
+
             HTTP=$(curl -sL -A "$UA" "${AUTH[@]}" \
               -e "https://pixeldrain.com/u/$FILE_ID" \
               --connect-timeout 30 --max-time 7200 \
               -w '%{http_code}' -o "$OUTF" \
               "https://pixeldrain.com/api/file/$FILE_ID?download" || true)
-            if [ "$HTTP" = "200" ] && [ -s "$OUTF" ]; then OK=1; break; fi
-            echo "Percobaan $i gagal, HTTP $HTTP. Respon server:"
-            head -c 600 "$OUTF" 2>/dev/null || true
-            echo
-            rm -f "$OUTF"
-            sleep 10
-          done
 
-          [ "$OK" = "1" ] || { echo "Download gagal (lihat respon server di atas)."; exit 1; }
+            if [ "$HTTP" != "200" ] || [ ! -s "$OUTF" ]; then
+              echo "Pixeldrain menolak (HTTP $HTTP):"
+              head -c 600 "$OUTF" 2>/dev/null || true
+              echo
+              echo "Pixeldrain memblokir download dari server kecuali akun berbayar."
+              echo "Pakai link host lain (direct link) atau API key akun Pixeldrain berbayar."
+              exit 1
+            fi
+          else
+            echo "Direct link biasa."
+            cd "$WORK/dl"
+            curl -fL -OJ -A "$UA" --retry 3 --retry-delay 5 \
+              --connect-timeout 30 --max-time 7200 "$ROM_URL"
+          fi
+
+          test -n "$(ls -A "$WORK/dl")"
           ls -lh "$WORK/dl"
 
       - name: Interactive Telegram bot
