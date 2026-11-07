@@ -81,14 +81,21 @@ jobs:
           EXT = WORK / "extracted"
           OUT = WORK / "out"
 
-          API_ID = int(os.environ["TELE_API_ID"])
-          API_HASH = os.environ["TELE_API_HASH"]
-          TOKEN = os.environ["BOT_TOKEN"]
-          CHAT = int(os.environ["TG_CHAT_ID"])
+          API_ID = int(os.environ.get("TELE_API_ID") or 0)
+          API_HASH = os.environ.get("TELE_API_HASH", "")
+          TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+          CHAT = int(os.environ.get("TG_CHAT_ID") or 0)
 
           PAGE = 8                     # item per halaman
           IDLE = 300                   # detik nunggu klik (5 menit)
           LIMIT = 1900 * 1024 * 1024   # batas per file Telegram (~2GB)
+
+          for _k, _v in (("BOT_TOKEN", TOKEN), ("TELE_API_ID", str(API_ID)),
+                         ("TELE_API_HASH", API_HASH), ("TG_CHAT_ID", str(CHAT))):
+              if not _v or _v == "0":
+                  raise SystemExit(f"Secret {_k} kosong / belum di-set di Settings > Secrets and variables > Actions")
+          if ":" not in TOKEN:
+              raise SystemExit("BOT_TOKEN formatnya salah, harus seperti 123456789:AAxxxx (dari @BotFather)")
 
           queue = asyncio.Queue()
 
