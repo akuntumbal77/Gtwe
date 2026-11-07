@@ -57,7 +57,7 @@ jobs:
         env:
           TELE_API_ID: ${{ secrets.TELE_API_ID }}
           TELE_API_HASH: ${{ secrets.TELE_API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         shell: bash
         run: |
@@ -90,12 +90,12 @@ jobs:
           IDLE = 300                   # detik nunggu klik (5 menit)
           LIMIT = 1900 * 1024 * 1024   # batas per file Telegram (~2GB)
 
-          for _k, _v in (("BOT_TOKEN", TOKEN), ("TELE_API_ID", str(API_ID)),
+          for _k, _v in (("TG_BOT_TOKEN", TOKEN), ("TELE_API_ID", str(API_ID)),
                          ("TELE_API_HASH", API_HASH), ("TG_CHAT_ID", str(CHAT))):
               if not _v or _v == "0":
                   raise SystemExit(f"Secret {_k} kosong / belum di-set di Settings > Secrets and variables > Actions")
           if ":" not in TOKEN:
-              raise SystemExit("BOT_TOKEN formatnya salah, harus seperti 123456789:AAxxxx (dari @BotFather)")
+              raise SystemExit("TG_BOT_TOKEN formatnya salah, harus seperti 123456789:AAxxxx (dari @BotFather)")
 
           queue = asyncio.Queue()
 
